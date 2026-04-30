@@ -1,19 +1,19 @@
 # deepseek-reasoning-proxy
 
-A lightweight reverse proxy that fixes opencode's `reasoning_content` bug when using DeepSeek V4 Pro.
+A lightweight reverse proxy that fixes the `reasoning_content` bug in [opencode](https://github.com/opencode-ai/opencode) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) when using DeepSeek V4 Pro.
 
 ## The Problem
 
-When using [opencode](https://github.com/opencode-ai/opencode) with DeepSeek's API, multi-turn conversations with tool calls fail with **HTTP 400 errors**. The root cause is a field name mismatch:
+When using opencode or Claude Code with DeepSeek's API, multi-turn conversations with tool calls fail with **HTTP 400 errors**. The root cause is a field name mismatch:
 
-| | opencode (SDK) | DeepSeek (API) |
+| | opencode / Claude Code (SDK) | DeepSeek (API) |
 |---|---|---|
 | Reasoning field | `reasoning_text` | `reasoning_content` |
 
-opencode's SDK internally uses `reasoning_text` — a field borrowed from GitHub Copilot's schema. DeepSeek's native API, however, uses `reasoning_content`. This mismatch causes two critical issues:
+Both opencode and Claude Code's SDKs internally use `reasoning_text` — a field borrowed from GitHub Copilot's schema. DeepSeek's native API, however, uses `reasoning_content`. This mismatch causes two critical issues:
 
-1. **Outbound**: When opencode sends assistant messages back in multi-turn conversations, it includes `reasoning_text` instead of `reasoning_content`. DeepSeek doesn't recognize the field and rejects the request.
-2. **Missing field**: DeepSeek V4 Pro **requires** `reasoning_content` to be present in assistant messages when tool calls are involved. opencode's SDK strips this field entirely, so even if the name were correct, the field would be absent — triggering a 400 error.
+1. **Outbound**: When the SDK sends assistant messages back in multi-turn conversations, it includes `reasoning_text` instead of `reasoning_content`. DeepSeek doesn't recognize the field and rejects the request.
+2. **Missing field**: DeepSeek V4 Pro **requires** `reasoning_content` to be present in assistant messages when tool calls are involved. The SDK strips this field entirely, so even if the name were correct, the field would be absent — triggering a 400 error.
 
 ## How It Works
 
