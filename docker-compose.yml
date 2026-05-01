@@ -1,0 +1,18 @@
+services:
+  deepseek-reasoning-proxy:
+    build: .
+    container_name: deepseek-reasoning-proxy
+    ports:
+      - "127.0.0.1:18200:18200"
+    command:
+      [
+        "python3",
+        "proxy.py",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "18200",
+        "--upstream",
+        "https://opencode.ai/zen/go"
+      ]
+    restart: unless-stopped
