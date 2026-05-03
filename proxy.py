@@ -22,11 +22,11 @@ import argparse
 import json
 import logging
 import re
-from typing import Any, Tuple
 from urllib.parse import urlsplit
+from typing import Any
 
 import aiohttp
-from aiohttp import web
+from aiohttp import ClientPayloadError, web
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("deepseek-proxy")
@@ -65,7 +65,7 @@ RESPONSE_HOP_BY_HOP = {
 def rename_key(obj: dict[str, Any], old_key: str, new_key: str) -> bool:
     """
     Rename a key if present.
-    Returns True when a mutation occurred.
+    Returns True if a mutation occurred.
     """
     if old_key in obj:
         obj[new_key] = obj.pop(old_key)
@@ -75,7 +75,7 @@ def rename_key(obj: dict[str, Any], old_key: str, new_key: str) -> bool:
 
 def translate_request_payload(payload: dict[str, Any]) -> bool:
     """
-    Mutate only the exact assistant turns DeepSeek requires.
+    Mutate only the assistant turns that need DeepSeek compatibility fixes.
 
     Returns True if the payload was modified.
     """
@@ -91,15 +91,15 @@ def translate_request_payload(payload: dict[str, Any]) -> bool:
         if msg.get("role") != "assistant":
             continue
 
-        # Preserve compatibility with SDKs that use reasoning_text.
+        # Convert SDK schema -> DeepSeek schema.
         if "reasoning_text" in msg:
             if "reasoning_content" not in msg:
                 msg["reasoning_content"] = msg["reasoning_text"]
             del msg["reasoning_text"]
             changed = True
 
-        # DeepSeek requires reasoning_content to be present for assistant turns
-        # that involved tool calls.
+        # DeepSeek V4 Pro requires reasoning_content on assistant turns that
+        # participate in tool calls. Do not blanket-inject it everywhere.
         if msg.get("tool_calls") and "reasoning_content" not in msg:
             msg["reasoning_content"] = ""
             changed = True
@@ -152,7 +152,7 @@ def translate_sse_chunk(chunk: bytes) -> bytes:
             lines.append(line)
             continue
 
-        data = line[match.end() :]
+        data = line[match.end():]
         if data.strip() == b"[DONE]":
             lines.append(line)
             continue
@@ -219,28 +219,34 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     headers["Accept-Encoding"] = "identity"
 
     try:
-        async with session.request(
+        resp = await session.request(
             method=request.method,
             url=upstream_url,
             headers=headers,
             data=forward_body if forward_body else None,
             timeout=aiohttp.ClientTimeout(total=300),
-        ) as resp:
-            response_headers = filtered_headers(resp.headers, RESPONSE_HOP_BY_HOP)
+        )
+    except Exception as e:
+        log.error("Upstream request failed: %s", e)
+        return web.Response(status=502, text="Upstream error")
 
-            if is_stream and "event-stream" in resp.headers.get("Content-Type", ""):
-                response_headers["Content-Type"] = resp.headers.get("Content-Type", "text/event-stream")
-                response_headers["Cache-Control"] = "no-cache"
-                response_headers["Connection"] = "keep-alive"
+    try:
+        response_headers = filtered_headers(resp.headers, RESPONSE_HOP_BY_HOP)
 
-                response = web.StreamResponse(
-                    status=resp.status,
-                    reason=resp.reason,
-                    headers=response_headers,
-                )
-                await response.prepare(request)
+        if is_stream and resp.content_type and "event-stream" in resp.content_type:
+            response_headers["Content-Type"] = resp.headers.get("Content-Type", "text/event-stream")
+            response_headers["Cache-Control"] = "no-cache"
+            response_headers["Connection"] = "keep-alive"
 
-                buffer = b""
+            response = web.StreamResponse(
+                status=resp.status,
+                reason=resp.reason,
+                headers=response_headers,
+            )
+            await response.prepare(request)
+
+            buffer = b""
+            try:
                 async for chunk in resp.content.iter_any():
                     buffer += chunk
                     while b"\n\n" in buffer:
@@ -252,29 +258,35 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                 if buffer.strip():
                     await response.write(translate_sse_chunk(buffer))
 
-                await response.write_eof()
-                return response
+            except ClientPayloadError:
+                log.error("Upstream stream terminated unexpectedly")
 
-            resp_body = await resp.read()
-
-            if resp_body:
+            finally:
                 try:
-                    resp_json = json.loads(resp_body)
-                    if isinstance(resp_json, dict) and translate_response_payload(resp_json):
-                        resp_body = json.dumps(resp_json, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                    await response.write_eof()
+                except Exception:
                     pass
 
-            return web.Response(
-                status=resp.status,
-                reason=resp.reason,
-                headers=response_headers,
-                body=resp_body,
-            )
+            return response
 
-    except Exception as e:
-        log.exception("Upstream request failed")
-        return web.Response(status=502, text="Upstream error")
+        resp_body = await resp.read()
+        if resp_body:
+            try:
+                resp_json = json.loads(resp_body)
+                if isinstance(resp_json, dict) and translate_response_payload(resp_json):
+                    resp_body = json.dumps(resp_json, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+
+        return web.Response(
+            status=resp.status,
+            reason=resp.reason,
+            headers=response_headers,
+            body=resp_body,
+        )
+
+    finally:
+        resp.close()
 
 
 async def health_handler(request: web.Request) -> web.Response:
@@ -296,7 +308,6 @@ def create_app(upstream: str) -> web.Application:
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
 
-    # Put health first so it is not shadowed by catch-alls.
     app.router.add_get("/health", health_handler)
     app.router.add_route("*", "/v1/{path:.*}", proxy_handler)
     app.router.add_route("*", "/{path:.*}", proxy_handler)
